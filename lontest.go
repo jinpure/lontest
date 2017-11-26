@@ -2,14 +2,15 @@
 package lontest
 
 import (
+	"bytes"
 	"crypto/rand"
+	"encoding/binary"
+	mrand "math/rand"
 	//	"bytes"
-	"net"
-	"time"
-
 	"log"
-
+	"net"
 	"strings"
+	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -17,16 +18,16 @@ import (
 )
 
 const (
-	LonIP     string         = "121.201.58.246"
-	BaiduIP   string         = "119.75.216.20"
-	USAIP     string         = "161.202.139.107"
-	DNSHost   string         = "114.114.114.114"
-	LonPort   layers.UDPPort = 4789
-	appleMAC  string         = "28:cf:e9:58:ad:83"
-	huaweiMAC string         = "8c:34:fd:ea:b4:aa"
-	zteMAC    string         = "64:13:6c:a2:84:b9"
-	XiaomiMAC string         = "78:11:dc:03:7e:a0"
-	routerMAC string         = zteMAC
+	LonIP     string = "121.201.58.246"
+	BaiduIP   string = "119.75.216.20"
+	USAIP     string = "161.202.139.107"
+	DNSHost   string = "114.114.114.114"
+	LonPort   uint16 = 4789
+	appleMAC  string = "28:cf:e9:58:ad:83"
+	huaweiMAC string = "8c:34:fd:ea:b4:aa"
+	zteMAC    string = "64:13:6c:a2:84:b9"
+	XiaomiMAC string = "78:11:dc:03:7e:a0"
+	routerMAC string = zteMAC
 
 	snapshot_len int32  = 1024
 	VNI          uint32 = 998
@@ -95,8 +96,8 @@ func VxLanPingPkg(pingDst string) ([]byte, error) {
 		TTL:      65,
 	}
 	udpLayer := &layers.UDP{
-		SrcPort: LonPort,
-		DstPort: LonPort,
+		SrcPort: layers.UDPPort(LonPort),
+		DstPort: layers.UDPPort(LonPort),
 	}
 	udpLayer.SetNetworkLayerForChecksum(ipLayer)
 
@@ -134,8 +135,8 @@ func VxLanPing(pingDst string) error {
 		TTL:      65,
 	}
 	udpLayer := &layers.UDP{
-		SrcPort: LonPort,
-		DstPort: LonPort,
+		SrcPort: layers.UDPPort(LonPort),
+		DstPort: layers.UDPPort(LonPort),
 	}
 	udpLayer.SetNetworkLayerForChecksum(ipLayer)
 
@@ -325,53 +326,71 @@ func VxLanDNS(dnsHost, dn string) error {
 
 func TCPSynPkg(dstIP string, srcPort, dstPort uint16) []byte {
 
+	var mss uint16 = 1460
+	mssOptData := make([]byte, 2)
+	mssOptData[0] = byte(mss >> 8)
+	mssOptData[1] = byte(mss)
+	mssOpt := layers.TCPOption{
+		OptionType:   2,
+		OptionLength: 4,
+		OptionData:   mssOptData,
+	}
+	noOpOpt := layers.TCPOption{
+		OptionType: 1,
+	}
+	wsOpt := layers.TCPOption{
+		OptionType:   3,
+		OptionLength: 3,
+		OptionData:   []byte{5},
+	}
+	var tsBuf bytes.Buffer
+	binary.Write(&tsBuf, binary.BigEndian, uint32(time.Now().UnixNano()/1000000))
+	binary.Write(&tsBuf, binary.BigEndian, uint32(0))
+	tsOpt := layers.TCPOption{
+		OptionType:   8,
+		OptionLength: 10,
+		OptionData:   tsBuf.Bytes(),
+	}
+	sackOpt := layers.TCPOption{
+		OptionType:   4,
+		OptionLength: 2,
+	}
+	eol := layers.TCPOption{
+		OptionType: 0,
+	}
 	synTCP := &layers.TCP{
 		SrcPort: layers.TCPPort(srcPort),
 		DstPort: layers.TCPPort(dstPort),
 		Seq:     100,
 		SYN:     true,
-		ECE:     true,
-		CWR:     true,
-		//		ACK:     true,
-		Window: 4096,
-		//		Ack:    1,
+		Window:  46635,
+		Options: []layers.TCPOption{mssOpt, noOpOpt, wsOpt, noOpOpt, noOpOpt, tsOpt, sackOpt, eol},
 	}
-	synTCP.SetNetworkLayerForChecksum(new(layers.IPv4))
+
+	dstMAC, _ := net.ParseMAC(routerMAC)
+
+	ipLayer := &layers.IPv4{
+		SrcIP:    myIP,
+		DstIP:    net.ParseIP(dstIP),
+		Version:  4,
+		IHL:      5,
+		Protocol: layers.IPProtocolTCP,
+		TTL:      64,
+	}
+
+	etherLayer := &layers.Ethernet{
+		SrcMAC:       myMAC,
+		DstMAC:       dstMAC,
+		EthernetType: layers.EthernetTypeIPv4,
+	}
+
+	synTCP.SetNetworkLayerForChecksum(ipLayer)
 	buffer := gopacket.NewSerializeBuffer()
-	gopacket.SerializeLayers(buffer, options, synTCP)
-	return MAC_IPPkg(dstIP, layers.IPProtocolTCP, buffer.Bytes())
+	gopacket.SerializeLayers(buffer, options, etherLayer, ipLayer, synTCP)
+	return buffer.Bytes()
 }
 
-//func ARPPkg(srcMAC, srcIP, dstMAC, dstIP string) []byte {
-//	dstmac, _ := net.ParseMAC(dstMAC)
-//	srcmac, _ := net.ParseMAC(srcMAC)
-//	arp := &layers.ARP{
-//		AddrType:          layers.LinkTypeEthernet,
-//		Protocol:          layers.EthernetTypeIPv4,
-//		HwAddressSize:     6,
-//		ProtAddressSize:   4,
-//		Operation:         1,
-//		SourceHwAddress:   srcmac,
-//		SourceProtAddress: net.ParseIP(srcIP),
-//		DstHwAddress:      dstmac,
-//		DstProtAddress:    net.ParseIP(srcMAC),
-//	}
-
-//	routemac, _ := net.ParseMAC(routerMAC)
-
-//	etherLayer := &layers.Ethernet{
-//		SrcMAC:       myMAC,
-//		DstMAC:       routemac,
-//		EthernetType: layers.EthernetTypeARP,
-//	}
-
-//	buffer := gopacket.NewSerializeBuffer()
-//	gopacket.SerializeLayers(buffer, options, etherLayer, arp)
-//	return buffer.Bytes()
-//}
-
 func ARPBroadcastPkg(srcMAC, srcIP string) []byte {
-	//	return ARPPkg(srcMAC, srcIP, "00:00:00:00:00:00", "0:0:0:0")
 
 	dstmac, _ := net.ParseMAC("00:00:00:00:00:00")
 	srcmac, _ := net.ParseMAC(srcMAC)
@@ -387,8 +406,6 @@ func ARPBroadcastPkg(srcMAC, srcIP string) []byte {
 		DstProtAddress:    []byte{192, 168, 18, 4},
 	}
 
-	//	routemac, _ := net.ParseMAC(routerMAC)
-	// net.ParseMAC(XiaomiMAC)
 	etherLayer := &layers.Ethernet{
 		SrcMAC:       srcmac,
 		DstMAC:       net.HardwareAddr{0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
@@ -438,4 +455,12 @@ func MAC_RandSrcIP_UDPPkg(dstIP string, srcPort, dstPort uint16, payload []byte)
 	gopacket.SerializeLayers(buffer, options, udp, gopacket.Payload(payload))
 
 	return MAC_RandSrcIPPkg(dstIP, layers.IPProtocolUDP, buffer.Bytes())
+}
+
+func NestVxLan(deepth int, dstIP string, payload []byte) []byte {
+
+	if deepth == 1 {
+		return VxLanPkg(VNI, payload)
+	}
+	return VxLanPkg(VNI, MAC_UDPPkg(dstIP, uint16(mrand.Int()), LonPort, NestVxLan(deepth-1, dstIP, payload)))
 }
