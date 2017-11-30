@@ -5,7 +5,10 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	mrand "math/rand"
+	"sync"
 	//	"bytes"
 	"log"
 	"net"
@@ -27,15 +30,16 @@ const (
 	huaweiMAC string = "8c:34:fd:ea:b4:aa"
 	zteMAC    string = "64:13:6c:a2:84:b9"
 	XiaomiMAC string = "78:11:dc:03:7e:a0"
-	routerMAC string = zteMAC
+	routerMAC string = huaweiMAC
 
-	snapshot_len int32  = 1024
+	snapshot_len int32  = 1600
 	VNI          uint32 = 998
 	promiscuous  bool   = false
 	//	err          error
 	timeout time.Duration = 30 * time.Second
 	//	handle  *pcap.Handle
-	filter string = "host 121.201.58.246"
+	filter      string = "host 121.201.58.246"
+	liveTimeout        = 30 * time.Second
 )
 
 var (
@@ -43,13 +47,13 @@ var (
 	myIP        net.IP
 	myMAC       net.HardwareAddr
 	options     gopacket.SerializeOptions = gopacket.SerializeOptions{true, true}
-	icmpPayload []byte
+	PingPayload []byte
 )
 
 func init() {
-	icmpPayload = make([]byte, 48)
+	PingPayload = make([]byte, 48)
 	for i := 0; i < 48; i++ {
-		icmpPayload[i] = byte(i + 8)
+		PingPayload[i] = byte(i + 8)
 	}
 
 	log.SetFlags(log.Ltime | log.Llongfile)
@@ -73,57 +77,22 @@ func SetEntherNet(dev string) {
 	myMAC = inface.HardwareAddr
 }
 
-func VxLanPkg(vin uint32, payload []byte) []byte {
+func VxLanPack(vin uint32, payload []byte) ([]byte, error) {
 	vxlan := &layers.VXLAN{
 		ValidIDFlag: true,
 		VNI:         VNI,
 	}
 	buffer := gopacket.NewSerializeBuffer()
-	gopacket.SerializeLayers(buffer, options, vxlan, gopacket.Payload(payload))
-
-	return buffer.Bytes()
-}
-
-func VxLanPingPkg(pingDst string) ([]byte, error) {
-	dstIP := net.ParseIP(LonIP)
-
-	ipLayer := &layers.IPv4{
-		SrcIP:    myIP,
-		DstIP:    dstIP,
-		Version:  4,
-		IHL:      5,
-		Protocol: layers.IPProtocolUDP,
-		TTL:      65,
+	err := gopacket.SerializeLayers(buffer, options, vxlan, gopacket.Payload(payload))
+	if err != nil {
+		log.Println(err)
+		return nil, err
 	}
-	udpLayer := &layers.UDP{
-		SrcPort: layers.UDPPort(LonPort),
-		DstPort: layers.UDPPort(LonPort),
-	}
-	udpLayer.SetNetworkLayerForChecksum(ipLayer)
-
-	dstmac, _ := net.ParseMAC(routerMAC)
-
-	etherLayer := &layers.Ethernet{
-		SrcMAC:       myMAC,
-		DstMAC:       dstmac,
-		EthernetType: layers.EthernetTypeIPv4,
-	}
-
-	buffer := gopacket.NewSerializeBuffer()
-
-	pingPlayload := PingPkg(pingDst)
-	//	if err != nil {
-	//		log.Println(err)
-	//		return nil, err
-	//	}
-	pingPkg := VxLanPkg(VNI, pingPlayload)
-	gopacket.SerializeLayers(buffer, options, etherLayer, ipLayer, udpLayer, gopacket.Payload(pingPkg))
 
 	return buffer.Bytes(), nil
 }
 
-func VxLanPing(pingDst string) error {
-
+func VxLanPingPack(pingDst string, id, seq uint16, payload []byte) ([]byte, error) {
 	dstIP := net.ParseIP(LonIP)
 
 	ipLayer := &layers.IPv4{
@@ -150,55 +119,82 @@ func VxLanPing(pingDst string) error {
 
 	buffer := gopacket.NewSerializeBuffer()
 
-	pingPlayload := PingPkg(pingDst)
-	pingPkg := VxLanPkg(VNI, pingPlayload)
-	gopacket.SerializeLayers(buffer, options, etherLayer, ipLayer, udpLayer, gopacket.Payload(pingPkg))
+	pingPlayload, err := PingPack(pingDst, id, seq, payload)
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+
+	pingPack, err := VxLanPack(VNI, pingPlayload)
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+	gopacket.SerializeLayers(buffer, options, etherLayer, ipLayer, udpLayer, gopacket.Payload(pingPack))
+
+	return buffer.Bytes(), nil
+}
+
+func VxLanPing(pingDst string, id uint16, times uint32, payload []byte) error {
 
 	handle, err := pcap.OpenLive(device, snapshot_len, promiscuous, timeout)
 	if err != nil {
-		log.Println(err)
 		return err
 	}
+	defer handle.Close()
+	var seq uint32 = 1
+	for ; seq <= times; seq++ {
 
-	handle.WritePacketData(buffer.Bytes())
-
+		icmpPack, err := VxLanPingPack(pingDst, id, uint16(seq), payload)
+		if err != nil {
+			log.Println(err)
+			return err
+		}
+		handle.WritePacketData(icmpPack)
+	}
 	return nil
 }
 
-func PingPkg(pingDst string) []byte {
+func PingPack(pingDst string, id, seq uint16, payload []byte) ([]byte, error) {
 
 	icmp := &layers.ICMPv4{
 		TypeCode: layers.CreateICMPv4TypeCode(8, 0),
-		Id:       100,
-		Seq:      1,
+		Id:       id,
+		Seq:      seq,
 	}
 
 	buffer := gopacket.NewSerializeBuffer()
 
-	gopacket.SerializeLayers(buffer, options, icmp, gopacket.Payload(icmpPayload))
-	return MAC_IPPkg(pingDst, layers.IPProtocolICMPv4, buffer.Bytes())
+	err := gopacket.SerializeLayers(buffer, options, icmp, gopacket.Payload(payload))
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+	return MAC_IPPack(pingDst, layers.IPProtocolICMPv4, buffer.Bytes()), nil
 
 }
 
-func Ping(pingDst string) error {
+func Ping(pingDst string, id uint16, times uint32, payload []byte) error {
 
-	//	buffer := gopacket.NewSerializeBuffer()
-	payload := PingPkg(pingDst)
-	//	if err != nil {
-	//		log.Println(err)
-	//		return err
-	//	}
-	//	gopacket.SerializeLayers(buffer, options, gopacket.Payload(payload))
 	handle, err := pcap.OpenLive(device, snapshot_len, promiscuous, timeout)
 	if err != nil {
 		return err
 	}
-	handle.WritePacketData(payload)
+	defer handle.Close()
+	var seq uint32 = 1
+	for ; seq <= times; seq++ {
 
+		icmpPack, err := PingPack(pingDst, id, uint16(seq), payload)
+		if err != nil {
+			log.Println(err)
+			return err
+		}
+		handle.WritePacketData(icmpPack)
+	}
 	return nil
 }
 
-func DNSQueryPkg(dnsHost, dn string) []byte {
+func DNSQueryPack(dnsHost, dn string) ([]byte, error) {
 	dns := &layers.DNS{
 		ID:      1,
 		QR:      false,
@@ -219,8 +215,11 @@ func DNSQueryPkg(dnsHost, dn string) []byte {
 	buffer := gopacket.NewSerializeBuffer()
 	gopacket.SerializeLayers(buffer, options, dns)
 
-	return MAC_UDPPkg(dnsHost, 53, 53, buffer.Bytes())
-	//	return IP_UDPPkg(dnsHost, 53, 53, buffer.Bytes())
+	ret, err := MAC_UDPPack(dnsHost, 53, 53, buffer.Bytes())
+	if err != nil {
+		log.Println(err)
+	}
+	return ret, err
 }
 
 func DNSQuery(dnsHost, dn string) error {
@@ -229,11 +228,16 @@ func DNSQuery(dnsHost, dn string) error {
 		log.Println(err)
 		return err
 	}
-	pkg := DNSQueryPkg(dnsHost, dn)
-	return handle.WritePacketData(pkg)
+	defer handle.Close()
+	pack, err := DNSQueryPack(dnsHost, dn)
+	if err != nil {
+		log.Println(err)
+		return err
+	}
+	return handle.WritePacketData(pack)
 }
 
-func MAC_IPPkg(dstIP string, protocol layers.IPProtocol, payload []byte) []byte {
+func MAC_IPPack(dstIP string, protocol layers.IPProtocol, payload []byte) []byte {
 
 	dstMAC, _ := net.ParseMAC(routerMAC)
 
@@ -258,7 +262,7 @@ func MAC_IPPkg(dstIP string, protocol layers.IPProtocol, payload []byte) []byte 
 	return buffer.Bytes()
 }
 
-func MAC_UDPPkg(dstIP string, srcPort, dstPort uint16, payload []byte) []byte {
+func MAC_UDPPack(dstIP string, srcPort, dstPort uint16, payload []byte) ([]byte, error) {
 
 	dstMAC, _ := net.ParseMAC(routerMAC)
 
@@ -283,12 +287,16 @@ func MAC_UDPPkg(dstIP string, srcPort, dstPort uint16, payload []byte) []byte {
 	udp.SetNetworkLayerForChecksum(ipLayer)
 	buffer := gopacket.NewSerializeBuffer()
 
-	gopacket.SerializeLayers(buffer, options, etherLayer, ipLayer, udp, gopacket.Payload(payload))
+	err := gopacket.SerializeLayers(buffer, options, etherLayer, ipLayer, udp, gopacket.Payload(payload))
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
 
-	return buffer.Bytes()
+	return buffer.Bytes(), nil
 }
 
-func IP_UDPPkg(dstIP string, srcPort, dstPort uint16, payload []byte) []byte {
+func IP_UDPPack(dstIP string, srcPort, dstPort uint16, payload []byte) []byte {
 
 	udp := &layers.UDP{
 		SrcPort: layers.UDPPort(srcPort),
@@ -308,10 +316,23 @@ func IP_UDPPkg(dstIP string, srcPort, dstPort uint16, payload []byte) []byte {
 	return buffer.Bytes()
 }
 
-func VxLanDnsPkg(dnsHost, dn string) []byte {
+func VxLanDnsPack(dnsHost, dn string) ([]byte, error) {
+	dnsPack, err := DNSQueryPack(dnsHost, dn)
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+	vxlanPack, err := VxLanPack(VNI, dnsPack)
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
 
-	return MAC_UDPPkg(LonIP, uint16(LonPort), uint16(LonPort), VxLanPkg(VNI, DNSQueryPkg(dnsHost, dn)))
-	//return IP_UDPPkg(lonIP, uint16(lonPort), uint16(lonPort), VxLanPkg(vni, DNSQueryPkg(dnsHost, dn)))
+	ret, err := MAC_UDPPack(LonIP, uint16(LonPort), uint16(LonPort), vxlanPack)
+	if err != nil {
+		log.Println(err)
+	}
+	return ret, err
 }
 func VxLanDNS(dnsHost, dn string) error {
 
@@ -320,11 +341,22 @@ func VxLanDNS(dnsHost, dn string) error {
 		log.Println(err)
 		return err
 	}
-	pkg := VxLanDnsPkg(dnsHost, dn)
-	return handle.WritePacketData(pkg)
+	defer handle.Close()
+	pack, err := VxLanDnsPack(dnsHost, dn)
+	if err != nil {
+		log.Println(err)
+		return err
+	}
+	err = handle.WritePacketData(pack)
+	if err != nil {
+		log.Println(err)
+		return err
+	}
+
+	return nil
 }
 
-func TCPSynPkg(dstIP string, srcPort, dstPort uint16) []byte {
+func TCPSynPack(dstIP string, srcPort, dstPort uint16) []byte {
 
 	var mss uint16 = 1460
 	mssOptData := make([]byte, 2)
@@ -390,10 +422,13 @@ func TCPSynPkg(dstIP string, srcPort, dstPort uint16) []byte {
 	return buffer.Bytes()
 }
 
-func ARPBroadcastPkg(srcMAC, srcIP string) []byte {
+func ARPPack(srcMAC, srcIP string) ([]byte, error) {
 
 	dstmac, _ := net.ParseMAC("00:00:00:00:00:00")
 	srcmac, _ := net.ParseMAC(srcMAC)
+	dstIP := make([]byte, 4) //随机目的IP
+	srcProtAddress := []byte(net.ParseIP(srcIP))
+	rand.Read(dstIP)
 	arp := &layers.ARP{
 		AddrType:          layers.LinkTypeEthernet,
 		Protocol:          layers.EthernetTypeIPv4,
@@ -401,9 +436,9 @@ func ARPBroadcastPkg(srcMAC, srcIP string) []byte {
 		ProtAddressSize:   uint8(4),
 		Operation:         uint16(1),
 		SourceHwAddress:   srcmac,
-		SourceProtAddress: []byte{192, 168, 18, 1},
+		SourceProtAddress: srcProtAddress[len(srcIP)-4:],
 		DstHwAddress:      dstmac,
-		DstProtAddress:    []byte{192, 168, 18, 4},
+		DstProtAddress:    dstIP,
 	}
 
 	etherLayer := &layers.Ethernet{
@@ -413,11 +448,15 @@ func ARPBroadcastPkg(srcMAC, srcIP string) []byte {
 	}
 
 	buffer := gopacket.NewSerializeBuffer()
-	gopacket.SerializeLayers(buffer, options, etherLayer, arp)
-	return buffer.Bytes()
+	err := gopacket.SerializeLayers(buffer, options, etherLayer, arp)
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+	return buffer.Bytes(), nil
 }
 
-func MAC_RandSrcIPPkg(dstIP string, protocol layers.IPProtocol, payload []byte) []byte {
+func MAC_RandSrcIPPack(dstIP string, protocol layers.IPProtocol, payload []byte) []byte {
 
 	dstMAC, _ := net.ParseMAC(routerMAC)
 	myIP := make([]byte, 4)
@@ -443,7 +482,7 @@ func MAC_RandSrcIPPkg(dstIP string, protocol layers.IPProtocol, payload []byte) 
 	return buffer.Bytes()
 }
 
-func MAC_RandSrcIP_UDPPkg(dstIP string, srcPort, dstPort uint16, payload []byte) []byte {
+func MAC_RandSrcIP_UDPPack(dstIP string, srcPort, dstPort uint16, payload []byte) []byte {
 
 	udp := &layers.UDP{
 		SrcPort: layers.UDPPort(srcPort),
@@ -454,13 +493,185 @@ func MAC_RandSrcIP_UDPPkg(dstIP string, srcPort, dstPort uint16, payload []byte)
 
 	gopacket.SerializeLayers(buffer, options, udp, gopacket.Payload(payload))
 
-	return MAC_RandSrcIPPkg(dstIP, layers.IPProtocolUDP, buffer.Bytes())
+	return MAC_RandSrcIPPack(dstIP, layers.IPProtocolUDP, buffer.Bytes())
 }
 
-func NestVxLan(deepth int, dstIP string, payload []byte) []byte {
+func NestVxLan(deepth int, dstIP string, payload []byte) ([]byte, error) {
 
 	if deepth == 1 {
-		return VxLanPkg(VNI, payload)
+		ret, err := VxLanPack(VNI, payload)
+		if err != nil {
+			log.Println(err)
+
+		}
+		return ret, err
 	}
-	return VxLanPkg(VNI, MAC_UDPPkg(dstIP, uint16(mrand.Int()), LonPort, NestVxLan(deepth-1, dstIP, payload)))
+
+	nestPayload, err := NestVxLan(deepth-1, dstIP, payload)
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+
+	vxlanPayload, err := MAC_UDPPack(dstIP, uint16(mrand.Int()), LonPort, nestPayload)
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+	ret, err := VxLanPack(VNI, vxlanPayload)
+	if err != nil {
+		log.Println(err)
+	}
+	return ret, err
+}
+
+type PackTimer interface {
+	Rtt(times int) (uint64, error)
+}
+
+func NewPacketTimer(timerType, host string, port uint16) (PackTimer, error) {
+	var timer PackTimer
+	switch timerType {
+	//	case "udpv4", "udp":
+	//	case "tcpv4", "tcp":
+	case "icmpv4", "icmp":
+		timer = &ICMPv4Timer{
+			Host: host,
+		}
+	default:
+		return nil, errors.New("Unsupported timer type.")
+	}
+
+	return timer, nil
+}
+
+type ICMPv4Timer struct {
+	Host   string
+	id     uint16
+	handle *pcap.Handle
+	lock   sync.Mutex
+}
+
+func (this *ICMPv4Timer) Rtt(times int) (uint64, error) {
+
+	this.lock.Lock()
+	defer this.lock.Unlock()
+
+	this.id = uint16(mrand.Int())
+
+	handle, err := pcap.OpenLive(device, snapshot_len, false, 5*time.Second)
+	if err != nil {
+		log.Println(err)
+		return 0, err
+	}
+	this.handle = handle
+	defer func() {
+		this.handle.Close()
+		this.handle = nil
+	}()
+	err = handle.SetBPFFilter(fmt.Sprintf("icmp && host %s ", this.Host))
+	if err != nil {
+		log.Println(err)
+		return 0, err
+	}
+	err = handle.SetDirection(pcap.DirectionIn)
+	if err != nil {
+		log.Println(err)
+		return 0, err
+	}
+
+	go this.injectPack(times)
+
+	rtt, err := this.capPack(times)
+	if err != nil {
+		log.Println(err)
+		return 0, err
+	}
+
+	return rtt, nil
+
+}
+
+func (this *ICMPv4Timer) injectPack(times int) error {
+
+	var tsBuf bytes.Buffer
+	for seq := 1; seq <= times; seq++ {
+		tsBuf.Reset()
+		binary.Write(&tsBuf, binary.BigEndian, time.Now().UnixNano()/1000000) //The number of microseconds elapsed since January 1, 1970 UTC
+		pingPack, err := PingPack(this.Host, this.id, uint16(seq), tsBuf.Bytes())
+		if err != nil {
+			log.Println(err)
+			return err
+		}
+		err = this.handle.WritePacketData(pingPack)
+		if err != nil {
+			log.Println(err)
+			return err
+		}
+		time.Sleep(500 * time.Microsecond)
+	}
+
+	return nil
+
+}
+
+func (this *ICMPv4Timer) capPack(times int) (uint64, error) {
+
+	var (
+		//		eth   layers.Ethernet
+		//		ip4   layers.IPv4
+		icmp4 layers.ICMPv4
+		rtt   int64
+		err   error
+	)
+
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeICMPv4, &icmp4)
+	decoded := []gopacket.LayerType{}
+	packetSource := gopacket.NewPacketSource(this.handle, this.handle.LinkType())
+	i := 0
+	for packet := range packetSource.Packets() {
+		log.Println("i", i)
+		//		data, capInfo, err := this.handle.ReadPacketData()
+		//		if err != nil {
+		//			log.Println(err)
+		//			return 0, err
+		//		}
+		//parse the captured packet
+
+		err = parser.DecodeLayers(packet.Data(), &decoded)
+		if err != nil {
+			log.Println(err)
+			return 0, err
+		}
+
+		if icmp4.Id != this.id {
+			continue //It‘s not mine
+		}
+
+		var ts int64
+		buf := bytes.NewBuffer(icmp4.Payload)
+		err = binary.Read(buf, binary.BigEndian, &ts) //get the timestamp
+		if err != nil {
+			log.Println(err)
+			return 0, err
+		}
+		capInfo := packet.Metadata().CaptureInfo
+		rtt += capInfo.Timestamp.UnixNano()*1000000 - ts
+		i++
+		if i == times {
+			break
+		}
+	}
+
+	return uint64(rtt / int64(times)), nil
+}
+
+type TCPTimer struct {
+	Host string
+	Port uint16
+}
+
+type UDPTimer struct {
+	Host string
+	Port uint16
 }
