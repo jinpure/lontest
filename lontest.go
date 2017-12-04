@@ -7,12 +7,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	mrand "math/rand"
-	"sync"
-	//	"bytes"
 	"log"
+	mrand "math/rand"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/gopacket"
@@ -30,16 +29,14 @@ const (
 	huaweiMAC string = "8c:34:fd:ea:b4:aa"
 	zteMAC    string = "64:13:6c:a2:84:b9"
 	XiaomiMAC string = "78:11:dc:03:7e:a0"
-	routerMAC string = huaweiMAC
+	routerMAC string = zteMAC
 
-	snapshot_len int32  = 1600
-	VNI          uint32 = 998
-	promiscuous  bool   = false
-	//	err          error
-	timeout time.Duration = 30 * time.Second
-	//	handle  *pcap.Handle
-	filter      string = "host 121.201.58.246"
-	liveTimeout        = 30 * time.Second
+	snapshot_len int32         = 1600
+	VNI          uint32        = 998
+	promiscuous  bool          = false
+	timeout      time.Duration = 30 * time.Second
+	filter       string        = "host 121.201.58.246"
+	liveTimeout                = 30 * time.Second
 )
 
 var (
@@ -529,15 +526,20 @@ type PackTimer interface {
 	Rtt(times int) (uint64, error)
 }
 
-func NewPacketTimer(timerType, host string, port uint16) (PackTimer, error) {
+func NewPacketTimer(timerType, dstHost string, port uint16) (PackTimer, error) {
 	var timer PackTimer
 	switch timerType {
 	//	case "udpv4", "udp":
 	//	case "tcpv4", "tcp":
 	case "icmpv4", "icmp":
 		timer = &ICMPv4Timer{
-			Host: host,
+			Host: dstHost,
 		}
+	case "xicmpv4", "xicmp":
+		icmp := &ICMPv4Timer{
+			Host: dstHost,
+		}
+		timer = NewVxLanTimer(LonIP, icmp)
 	default:
 		return nil, errors.New("Unsupported timer type.")
 	}
@@ -545,11 +547,26 @@ func NewPacketTimer(timerType, host string, port uint16) (PackTimer, error) {
 	return timer, nil
 }
 
+func NewVxLanTimer(xHost string, payload VxLanTimerPayload) *VxLanTimer {
+	return &VxLanTimer{
+		XHost:   xHost,
+		Payload: payload,
+	}
+}
+
 type ICMPv4Timer struct {
-	Host   string
-	id     uint16
-	handle *pcap.Handle
-	lock   sync.Mutex
+	Host    string
+	id      uint16
+	seq     uint16
+	handle  *pcap.Handle
+	lock    sync.Mutex
+	rttChan chan uint64
+}
+
+func NewICMPv4Timer(host string) *ICMPv4Timer {
+	return &ICMPv4Timer{
+		Host: host,
+	}
 }
 
 func (this *ICMPv4Timer) Rtt(times int) (uint64, error) {
@@ -570,6 +587,7 @@ func (this *ICMPv4Timer) Rtt(times int) (uint64, error) {
 		this.handle = nil
 	}()
 	err = handle.SetBPFFilter(fmt.Sprintf("icmp && host %s ", this.Host))
+	//	err = handle.SetBPFFilter(fmt.Sprintf("icmp"))
 	if err != nil {
 		log.Println(err)
 		return 0, err
@@ -579,26 +597,22 @@ func (this *ICMPv4Timer) Rtt(times int) (uint64, error) {
 		log.Println(err)
 		return 0, err
 	}
-
-	go this.injectPack(times)
-
-	rtt, err := this.capPack(times)
-	if err != nil {
-		log.Println(err)
-		return 0, err
+	if this.rttChan == nil {
+		this.rttChan = make(chan uint64)
 	}
+	go this.capPack(times)
 
+	this.injectPack(times)
+	rtt := <-this.rttChan
 	return rtt, nil
 
 }
 
 func (this *ICMPv4Timer) injectPack(times int) error {
 
-	var tsBuf bytes.Buffer
 	for seq := 1; seq <= times; seq++ {
-		tsBuf.Reset()
-		binary.Write(&tsBuf, binary.BigEndian, time.Now().UnixNano()/1000000) //The number of microseconds elapsed since January 1, 1970 UTC
-		pingPack, err := PingPack(this.Host, this.id, uint16(seq), tsBuf.Bytes())
+
+		pingPack, err := this.Serialize()
 		if err != nil {
 			log.Println(err)
 			return err
@@ -615,55 +629,74 @@ func (this *ICMPv4Timer) injectPack(times int) error {
 
 }
 
+func (this *ICMPv4Timer) Serialize() ([]byte, error) {
+	ts := &bytes.Buffer{}
+	binary.Write(ts, binary.BigEndian, uint64(time.Now().UnixNano()/1000000))
+	this.seq++
+	log.Println("now:", ts)
+	data, err := PingPack(this.Host, this.id, this.seq, ts.Bytes())
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+
+	return data, err
+}
+
+func (this *ICMPv4Timer) DecodeTimestamp(data []byte) (int64, error) {
+	var (
+		eth       layers.Ethernet
+		ip4       layers.IPv4
+		icmp4     layers.ICMPv4
+		timestamp gopacket.Payload
+		err       error
+	)
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip4, &icmp4, &timestamp)
+	parser.IgnoreUnsupported = true
+	parser.IgnorePanic = true
+	decoded := []gopacket.LayerType{}
+
+	err = parser.DecodeLayers(data, &decoded)
+	if err != nil {
+		log.Println(err)
+		return 0, err
+	}
+	if icmp4.Id != this.id {
+		return 0, errors.New("not mine")
+	}
+	log.Println("timestamp", timestamp)
+	return int64(binary.BigEndian.Uint64(timestamp)), nil
+}
+
 func (this *ICMPv4Timer) capPack(times int) (uint64, error) {
 
 	var (
-		//		eth   layers.Ethernet
-		//		ip4   layers.IPv4
-		icmp4 layers.ICMPv4
-		rtt   int64
-		err   error
+		rtt int64
 	)
 
-	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeICMPv4, &icmp4)
-	decoded := []gopacket.LayerType{}
 	packetSource := gopacket.NewPacketSource(this.handle, this.handle.LinkType())
 	i := 0
 	for packet := range packetSource.Packets() {
-		log.Println("i", i)
-		//		data, capInfo, err := this.handle.ReadPacketData()
-		//		if err != nil {
-		//			log.Println(err)
-		//			return 0, err
-		//		}
-		//parse the captured packet
 
-		err = parser.DecodeLayers(packet.Data(), &decoded)
+		ts, err := this.DecodeTimestamp(packet.Data())
 		if err != nil {
-			log.Println(err)
-			return 0, err
-		}
-
-		if icmp4.Id != this.id {
-			continue //It‘s not mine
-		}
-
-		var ts int64
-		buf := bytes.NewBuffer(icmp4.Payload)
-		err = binary.Read(buf, binary.BigEndian, &ts) //get the timestamp
-		if err != nil {
+			if err.Error() == "not mine" {
+				continue
+			}
 			log.Println(err)
 			return 0, err
 		}
 		capInfo := packet.Metadata().CaptureInfo
-		rtt += capInfo.Timestamp.UnixNano()*1000000 - ts
+		log.Println("ts", ts)
+		rtt += capInfo.Timestamp.UnixNano()/1000000 - ts
 		i++
 		if i == times {
 			break
 		}
 	}
-
-	return uint64(rtt / int64(times)), nil
+	ret := uint64(rtt / int64(times))
+	this.rttChan <- ret
+	return ret, nil
 }
 
 type TCPTimer struct {
@@ -674,4 +707,44 @@ type TCPTimer struct {
 type UDPTimer struct {
 	Host string
 	Port uint16
+}
+
+type VxLanTimer struct {
+	VNI   uint32
+	XHost string
+	//	Host    string
+	Payload VxLanTimerPayload
+	conn    net.Conn
+	lock    sync.Mutex
+}
+
+type VxLanTimerPayload interface {
+	Serialize() ([]byte, error)
+	DecodeTimestamp(data []byte) (int64, error)
+}
+
+func (this *VxLanTimer) Rtt(times int) (uint64, error) {
+
+	this.lock.Lock()
+	defer this.lock.Unlock()
+	conn, err := net.Dial("udp", this.XHost)
+	if err != nil {
+		log.Println(err)
+		return 0, err
+	}
+	this.conn = conn
+	defer this.conn.Close()
+
+	return 0, nil
+
+}
+
+func (this *VxLanTimer) send(times int) error {
+
+	return nil
+}
+
+func (this *VxLanTimer) receive(time int) (uint64, error) {
+
+	return 0, nil
 }
