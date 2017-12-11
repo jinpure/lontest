@@ -29,7 +29,7 @@ const (
 	huaweiMAC string = "8c:34:fd:ea:b4:aa"
 	zteMAC    string = "64:13:6c:a2:84:b9"
 	XiaomiMAC string = "78:11:dc:03:7e:a0"
-	routerMAC string = XiaomiMAC
+	routerMAC string = zteMAC
 
 	snapshot_len int32         = 1600
 	VNI          uint32        = 998
@@ -167,8 +167,8 @@ func PingPack(pingDst string, id, seq uint16, payload []byte) ([]byte, error) {
 		log.Println(err)
 		return nil, err
 	}
-	return MAC_IPPack(pingDst, layers.IPProtocolICMPv4, buffer.Bytes()), nil
 
+	return MAC_IPPack(pingDst, layers.IPProtocolICMPv4, buffer.Bytes()), nil
 }
 
 func Ping(pingDst string, id uint16, times uint32, payload []byte) error {
@@ -255,6 +255,25 @@ func MAC_IPPack(dstIP string, protocol layers.IPProtocol, payload []byte) []byte
 
 	buffer := gopacket.NewSerializeBuffer()
 	gopacket.SerializeLayers(buffer, options, etherLayer, ipLayer, gopacket.Payload(payload))
+
+	return buffer.Bytes()
+}
+
+func IPPack(dstIP string, protocol layers.IPProtocol, payload []byte) []byte {
+
+	//	dstMAC, _ := net.ParseMAC(routerMAC)
+
+	ipLayer := &layers.IPv4{
+		SrcIP:    myIP,
+		DstIP:    net.ParseIP(dstIP),
+		Version:  4,
+		IHL:      5,
+		Protocol: protocol,
+		TTL:      64,
+	}
+
+	buffer := gopacket.NewSerializeBuffer()
+	gopacket.SerializeLayers(buffer, options, ipLayer, gopacket.Payload(payload))
 
 	return buffer.Bytes()
 }
@@ -374,7 +393,8 @@ func TCPSynPack(dstIP string, srcPort, dstPort uint16) ([]byte, error) {
 	}
 	var tsBuf bytes.Buffer
 	now := time.Now()
-	ts := midNightDuration(&now).Nanoseconds() / 10000000 //从午夜到当前时刻的毫秒数
+	ts := midNightDuration(&now) / time.Millisecond //从午夜到当前时刻的毫秒数
+	//	log.Println("sync ts:", ts)
 	binary.Write(&tsBuf, binary.BigEndian, uint32(ts))
 	binary.Write(&tsBuf, binary.BigEndian, uint32(0))
 	tsOpt := layers.TCPOption{
@@ -392,10 +412,46 @@ func TCPSynPack(dstIP string, srcPort, dstPort uint16) ([]byte, error) {
 	synTCP := &layers.TCP{
 		SrcPort: layers.TCPPort(srcPort),
 		DstPort: layers.TCPPort(dstPort),
-		Seq:     100,
+		Seq:     0,
 		SYN:     true,
 		Window:  46635,
 		Options: []layers.TCPOption{mssOpt, noOpOpt, wsOpt, noOpOpt, noOpOpt, tsOpt, sackOpt, eol},
+	}
+
+	dstMAC, _ := net.ParseMAC(routerMAC)
+
+	ipLayer := &layers.IPv4{
+		SrcIP:    myIP,
+		DstIP:    net.ParseIP(dstIP),
+		Version:  4,
+		IHL:      5,
+		Protocol: layers.IPProtocolTCP,
+		TTL:      64,
+	}
+
+	etherLayer := &layers.Ethernet{
+		SrcMAC:       myMAC,
+		DstMAC:       dstMAC,
+		EthernetType: layers.EthernetTypeIPv4,
+	}
+
+	synTCP.SetNetworkLayerForChecksum(ipLayer)
+	buffer := gopacket.NewSerializeBuffer()
+	err := gopacket.SerializeLayers(buffer, options, etherLayer, ipLayer, synTCP)
+	if err != nil {
+		log.Println(err)
+		return nil, err
+	}
+	return buffer.Bytes(), nil
+}
+
+func TCPResetPack(dstIP string, srcPort, dstPort uint16, seq uint32) ([]byte, error) {
+
+	synTCP := &layers.TCP{
+		SrcPort: layers.TCPPort(srcPort),
+		DstPort: layers.TCPPort(dstPort),
+		Seq:     seq,
+		RST:     true,
 	}
 
 	dstMAC, _ := net.ParseMAC(routerMAC)
@@ -532,22 +588,18 @@ type PackTimer interface {
 	Rtt(times int) (uint64, error)
 }
 
-func NewPacketTimer(timerType, dstHost string, port uint16) (PackTimer, error) {
+func NewPacketTimer(timerType, dstHost string, dstPort uint16) (PackTimer, error) {
+
 	var timer PackTimer
 	switch timerType {
-	//	case "udpv4", "udp":
-	//	case "tcpv4", "tcp":
+	case "udpv4", "udp":
+		timer = NewUDPTimer(dstHost)
+	case "tcpv4", "tcp":
+		timer = NewTcpTimer(dstHost, dstPort)
 	case "icmpv4", "icmp":
-		timer = &BaseTimer{
-			ProtocolTimer: &ICMPv4Timer{
-				Host: dstHost,
-			},
-		}
+		timer = NewICMPv4Timer(dstHost)
 	case "xicmpv4", "xicmp":
-		icmp := &ICMPv4Timer{
-			Host: dstHost,
-		}
-		timer = NewVxLanTimer(LonIP, icmp)
+		timer = NewVxLanTimer(LonIP, LonPort, NewICMPv4Timer(dstHost))
 	default:
 		return nil, errors.New("Unsupported timer type.")
 	}
@@ -555,7 +607,7 @@ func NewPacketTimer(timerType, dstHost string, port uint16) (PackTimer, error) {
 	return timer, nil
 }
 
-func NewVxLanTimer(xHost string, payload VxLanTimerPayload) *VxLanTimer {
+func NewVxLanTimer(xHost string, xPort uint16, payload VxLanTimerPayload) *VxLanTimer {
 	return &VxLanTimer{
 		XHost:   xHost,
 		Payload: payload,
@@ -563,19 +615,25 @@ func NewVxLanTimer(xHost string, payload VxLanTimerPayload) *VxLanTimer {
 }
 
 type BaseTimer struct {
-	rttChan       chan uint64
 	lock          sync.Mutex
 	ProtocolTimer ProtocolTimer
 	handle        *pcap.Handle
+	rttChan       chan uint64
+	retRtt        uint64
+	done          chan byte
+	recvTimes     uint64
 }
 
 func (this *BaseTimer) Rtt(times int) (uint64, error) {
 
 	this.lock.Lock()
 	defer this.lock.Unlock()
-
-	//	this.id = uint16(mrand.Int())
-
+	if this.rttChan == nil {
+		this.rttChan = make(chan uint64, times)
+	}
+	if this.done == nil {
+		this.done = make(chan byte)
+	}
 	handle, err := pcap.OpenLive(device, snapshot_len, false, 5*time.Second)
 	if err != nil {
 		log.Println(err)
@@ -586,9 +644,8 @@ func (this *BaseTimer) Rtt(times int) (uint64, error) {
 		this.handle.Close()
 		this.handle = nil
 	}()
-	//	filter :=
+
 	err = handle.SetBPFFilter(this.ProtocolTimer.BPF())
-	//	err = handle.SetBPFFilter(fmt.Sprintf("icmp"))
 	if err != nil {
 		log.Println(err)
 		return 0, err
@@ -598,66 +655,107 @@ func (this *BaseTimer) Rtt(times int) (uint64, error) {
 		log.Println(err)
 		return 0, err
 	}
-	if this.rttChan == nil {
-		this.rttChan = make(chan uint64)
-	}
-	go this.capPack(times)
+	stopCap := make(chan byte, 1)
+	rttChan := this.ProtocolTimer.CapPack(stopCap) //抓返回包goroutine
+	go this.calcRtt(rttChan, times)                //累加RTT
+	go func(times int, done chan byte) {           //发包goroutine
+		for i := 1; i <= times; i++ {
 
-	this.injectPack(times)
-	rtt := <-this.rttChan
-	return rtt, nil
+			log.Println("i:", i)
+			err = this.ProtocolTimer.SendPack()
+			if err != nil {
+				log.Println(err)
+				return
+			}
+
+		}
+		log.Println("done")
+		done <- 0
+	}(times, this.done)
+
+	<-this.done //等待calcRtt退出
+	log.Println("calcRtt退出")
+	<-this.done //等待发包goroutine退出
+	log.Println("发包goroutine")
+	stopCap <- 0 //通知抓包goroutine退出
+	log.Println("stopCap")
+	if this.recvTimes == 0 {
+		return 0, errors.New("No reply packet")
+	}
+	return this.retRtt / this.recvTimes, nil //返回平均RTT值
 }
 
-func (this *BaseTimer) capPack(times int) (uint64, error) {
-
-	var (
-		rtt int64
-	)
-
-	packetSource := gopacket.NewPacketSource(this.handle, this.handle.LinkType())
-	i := 0
-	for packet := range packetSource.Packets() {
-
-		ts, err := this.ProtocolTimer.DecodeTimestamp(packet.Data())
-		if err != nil {
-			if err.Error() == "not mine" {
-				continue
-			}
-			log.Println(err)
-			return 0, err
-		}
-		capInfo := packet.Metadata().CaptureInfo
-		rtt += midNightDuration(&capInfo.Timestamp).Nanoseconds()/1000000 - ts
-		i++
-		if i == times {
+func (this *BaseTimer) calcRtt(rttChan chan uint64, times int) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for i := 1; i <= times; i++ {
+		select {
+		case rtt := <-rttChan:
+			this.retRtt += rtt
+			log.Println("rtt:", rtt)
+			this.recvTimes++
+		case <-ticker.C:
 			break
 		}
 	}
-	ret := uint64(rtt / int64(times))
-	this.rttChan <- ret
-	return ret, nil
+	this.done <- 0
+	log.Println("done")
 }
 
+//func (this *BaseTimer) capPack(times int) (uint64, error) {
+
+//	var (
+//		rtt uint64
+//	)
+
+//	packetSource := gopacket.NewPacketSource(this.handle, this.handle.LinkType())
+//	i := 0
+//	for packet := range packetSource.Packets() {
+
+//		ts, err := this.ProtocolTimer.DecodeTimestamp(packet.Data())
+//		if err != nil {
+//			if err.Error() == "Not mine" {
+//				continue
+//			}
+//			log.Println(err)
+//			return 0, err
+//		}
+//		capInfo := packet.Metadata().CaptureInfo
+//		rtt += uint64(midNightDuration(&capInfo.Timestamp).Nanoseconds())/1000000 - ts
+//		i++
+//		if i == times {
+//			break
+//		}
+//	}
+//	ret := uint64(rtt / uint64(times))
+//	this.rttChan <- ret
+//	return ret, nil
+//}
+
 type ProtocolTimer interface {
-	Serialize() ([]byte, error)
-	DecodeTimestamp([]byte) (int64, error)
+	//	Serialize() ([]byte, error)
+	//	DecodeTimestamp([]byte) (uint64, error)
 	BPF() string
+	SendPack() error
+	CapPack(stop chan byte) chan uint64
 }
 
 type ICMPv4Timer struct {
 	BaseTimer
-	Host    string
-	id      uint16
-	seq     uint16
-	handle  *pcap.Handle
-	lock    sync.Mutex
-	rttChan chan uint64
+	Host string
+	id   uint16
+	seq  uint16
+	//	handle *pcap.Handle
+	//	lock   sync.Mutex
 }
 
 func NewICMPv4Timer(host string) *ICMPv4Timer {
-	return &ICMPv4Timer{
+	timer := &ICMPv4Timer{
 		Host: host,
 	}
+	timer.BaseTimer.ProtocolTimer = timer
+
+	return timer
 }
 
 //func (this *ICMPv4Timer) Rtt(times int) (uint64, error) {
@@ -699,46 +797,43 @@ func NewICMPv4Timer(host string) *ICMPv4Timer {
 
 //}
 
-func (this *ICMPv4Timer) injectPack(times int) error {
+func (this *ICMPv4Timer) SendPack() error {
 
-	for seq := 1; seq <= times; seq++ {
-
-		pingPack, err := this.Serialize()
-		if err != nil {
-			log.Println(err)
-			return err
-		}
-		err = this.handle.WritePacketData(pingPack)
-		if err != nil {
-			log.Println(err)
-			return err
-		}
-		time.Sleep(500 * time.Microsecond)
+	pingPack, err := this.Serialize()
+	if err != nil {
+		log.Println(err)
+		return err
 	}
-
+	err = this.handle.WritePacketData(pingPack)
+	if err != nil {
+		log.Println(err)
+		return err
+	}
+	time.Sleep(time.Duration(uint16(mrand.Int())) * time.Microsecond)
 	return nil
 
 }
 
 func (this *ICMPv4Timer) Serialize() ([]byte, error) {
+
 	ts := &bytes.Buffer{}
 	this.seq++
 	now := time.Now()
-	binary.Write(ts, binary.BigEndian, midNightDuration(&now).Nanoseconds()/1000000)
+	binary.Write(ts, binary.BigEndian, uint64(midNightDuration(&now).Nanoseconds())/1000000)
 	data, err := PingPack(this.Host, this.id, this.seq, ts.Bytes())
 	if err != nil {
 		log.Println(err)
 		return nil, err
 	}
 
-	return data, err
+	return data, nil
 }
 
 func (this *ICMPv4Timer) BPF() string {
 	return fmt.Sprintf("icmp && host %s ", this.Host)
 }
 
-func (this *ICMPv4Timer) DecodeTimestamp(data []byte) (int64, error) {
+func (this *ICMPv4Timer) DecodeTimestamp(data []byte) (uint64, error) {
 	var (
 		eth       layers.Ethernet
 		ip4       layers.IPv4
@@ -757,79 +852,231 @@ func (this *ICMPv4Timer) DecodeTimestamp(data []byte) (int64, error) {
 		return 0, err
 	}
 	if icmp4.Id != this.id {
-		return 0, errors.New("not mine")
+		return 0, errors.New("Not mine")
 	}
-	log.Println("timestamp", timestamp)
-	return int64(binary.BigEndian.Uint64(timestamp)), nil
+	//	log.Println("timestamp", timestamp)
+	return binary.BigEndian.Uint64(timestamp), nil
 }
 
-func (this *BaseTimer) injectPack(times int) error {
+//func (this *BaseTimer) injectPack(times int) error {
 
-	for seq := 1; seq <= times; seq++ {
+//	for seq := 1; seq <= times; seq++ {
 
-		pingPack, err := this.ProtocolTimer.Serialize()
-		if err != nil {
-			log.Println(err)
-			return err
-		}
-		err = this.handle.WritePacketData(pingPack)
-		if err != nil {
-			log.Println(err)
-			return err
-		}
-		time.Sleep(500 * time.Microsecond)
-	}
+//		pingPack, err := this.ProtocolTimer.Serialize()
+//		if err != nil {
+//			log.Println(err)
+//			return err
+//		}
+//		err = this.handle.WritePacketData(pingPack)
+//		if err != nil {
+//			log.Println(err)
+//			return err
+//		}
+//		time.Sleep(500 * time.Microsecond)
+//	}
 
-	return nil
+//	return nil
 
-}
+//}
 
-func (this *ICMPv4Timer) capPack(times int) (uint64, error) {
-
+func (this *ICMPv4Timer) CapPack(stop chan byte) chan uint64 {
 	var (
-		rtt int64
+		//		packet  gopacket.Packet
+		err     error
+		ts      uint64
+		rttChan = make(chan uint64)
 	)
+	go func(stop chan byte) {
+		packetSource := gopacket.NewPacketSource(this.handle, this.handle.LinkType())
+		packets := packetSource.Packets()
+		for {
+			select {
+			case packet := <-packets:
 
-	packetSource := gopacket.NewPacketSource(this.handle, this.handle.LinkType())
-	i := 0
-	for packet := range packetSource.Packets() {
+				if packet == nil {
+					return
+				}
+				ts, err = this.DecodeTimestamp(packet.Data())
+				if err != nil {
 
-		ts, err := this.DecodeTimestamp(packet.Data())
-		if err != nil {
-			if err.Error() == "not mine" {
-				continue
+					log.Println(err)
+					return
+				}
+
+				capInfo := packet.Metadata().CaptureInfo
+				rtt := uint64(midNightDuration(&capInfo.Timestamp).Nanoseconds())/1000000 - ts
+				rttChan <- rtt
+
+			case <-stop:
+				return
 			}
-			log.Println(err)
-			return 0, err
 		}
-		capInfo := packet.Metadata().CaptureInfo
-		rtt += midNightDuration(&capInfo.Timestamp).Nanoseconds()/1000000 - ts
-		i++
-		if i == times {
-			break
-		}
-	}
-	ret := uint64(rtt / int64(times))
-	this.rttChan <- ret
-	return ret, nil
+	}(stop)
+	return rttChan
 }
 
 //返回t时刻到当天凌晨时间差
 func midNightDuration(t *time.Time) time.Duration {
 
-	log.Println("now:", t.String())
 	midNight := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
-	log.Println("midNight", midNight.String())
 	return t.Sub(midNight)
 }
 
 type TCPTimer struct {
 	BaseTimer
-	DstHost string
-	DstPort uint16
-	srcPort uint16
-	rttChan chan uint64
-	lock    sync.Mutex
+	DstHost       string
+	DstPort       uint16
+	srcPort       uint16
+	lock          sync.Mutex
+	timestampChan chan uint64
+	syncChan      chan uint64
+}
+
+func NewTcpTimer(dstHost string, dstPort uint16) *TCPTimer {
+	timer := &TCPTimer{
+		DstHost:       dstHost,
+		DstPort:       dstPort,
+		syncChan:      make(chan uint64),
+		timestampChan: make(chan uint64, 1),
+	}
+
+	timer.BaseTimer.ProtocolTimer = timer
+
+	return timer
+
+}
+
+//func (this *TCPTimer) Rtt(times int) (uint64, error) {
+
+//	var retRtt uint64
+
+//	this.BaseTimer.lock.Lock()
+//	defer this.BaseTimer.lock.Unlock()
+
+//	handle, err := pcap.OpenLive(device, snapshot_len, false, 5*time.Second)
+//	if err != nil {
+//		log.Println(err)
+//		return 0, err
+//	}
+//	this.handle = handle
+//	defer func() {
+//		this.handle.Close()
+//		this.handle = nil
+//	}()
+//	//	filter :=
+//	err = handle.SetBPFFilter(this.BPF())
+
+//	if err != nil {
+//		log.Println(err)
+//		return 0, err
+//	}
+//	err = handle.SetDirection(pcap.DirectionIn)
+//	if err != nil {
+//		log.Println(err)
+//		return 0, err
+//	}
+
+//	i := 1
+//	for ; i <= times; i++ {
+//		err = this.SendPack()
+//		if err != nil {
+//			log.Println(err)
+//			return 0, err
+//		}
+//		rtt, err := this.CapPack()
+//		if err != nil {
+//			log.Println(err)
+//			return 0, err
+//		}
+//		retRtt += rtt
+//	}
+//	return retRtt / uint64(i), nil
+//}
+
+func (this *TCPTimer) sendReset() error {
+
+	data, err := TCPResetPack(this.DstHost, this.srcPort, this.DstPort, 1)
+	if err != nil {
+		log.Println(err)
+		return err
+	}
+	err = this.handle.WritePacketData(data)
+	if err != nil {
+		log.Println(err)
+		return err
+	}
+
+	return nil
+}
+
+func (this *TCPTimer) SendPack() error {
+	if this.syncChan == nil {
+		this.syncChan = make(chan uint64)
+	}
+	this.srcPort = uint16(mrand.Int())
+	data, err := this.Serialize()
+	if err != nil {
+		log.Println(err)
+		return err
+	}
+	now := time.Now()
+	sendTimestamp := uint64(midNightDuration(&now) / time.Millisecond)
+	this.timestampChan <- sendTimestamp
+	err = this.handle.WritePacketData(data)
+	if err != nil {
+		log.Println(err)
+	}
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	select {
+	case <-ticker.C:
+		return nil
+	case <-this.syncChan:
+		err = this.sendReset()
+		if err != nil {
+			log.Println(err)
+			return err
+		}
+	}
+
+	return err
+}
+
+func (this *TCPTimer) CapPack(stopChan chan byte) chan uint64 {
+
+	packetSource := gopacket.NewPacketSource(this.handle, this.handle.LinkType())
+	packets := packetSource.Packets()
+	rttChan := make(chan uint64)
+	go func() {
+		var (
+			err error
+			ts  uint64
+		)
+		for {
+			select {
+			case packet := <-packets:
+				this.syncChan <- 0
+				ts, err = this.DecodeTimestamp(packet.Data())
+				if err != nil {
+					if err.Error() == "Not mine" {
+						continue
+					} else {
+						log.Println(err)
+						return
+					}
+				}
+				//				log.Println(uint64(midNightDuration(&packet.Metadata().CaptureInfo.Timestamp).Nanoseconds()) / 1000000)
+				rtt := uint64(midNightDuration(&packet.Metadata().CaptureInfo.Timestamp).Nanoseconds())/1000000 - ts
+				//				log.Println("rtt:", rtt)
+				rttChan <- rtt
+			case <-stopChan:
+				return
+			}
+		}
+	}()
+
+	return rttChan
+
 }
 
 //func (this *TCPTimer) Rtt(times int) (uint64, error) {
@@ -870,29 +1117,29 @@ type TCPTimer struct {
 //	return rtt, nil
 //}
 
-func (this *TCPTimer) injectPack(times int) error {
+//func (this *TCPTimer) injectPack(times int) error {
 
-	for i := 1; i <= times; i++ {
+//	for i := 1; i <= times; i++ {
 
-		pingPack, err := this.Serialize()
-		if err != nil {
-			log.Println(err)
-			return err
-		}
-		err = this.handle.WritePacketData(pingPack)
-		if err != nil {
-			log.Println(err)
-			return err
-		}
-		time.Sleep(500 * time.Microsecond)
-	}
+//		pingPack, err := this.Serialize()
+//		if err != nil {
+//			log.Println(err)
+//			return err
+//		}
+//		err = this.handle.WritePacketData(pingPack)
+//		if err != nil {
+//			log.Println(err)
+//			return err
+//		}
+//		time.Sleep(500 * time.Microsecond)
+//	}
 
-	return nil
-}
+//	return nil
+//}
 
-func (this *TCPTimer) capPack(times int) error {
-	return nil
-}
+//func (this *TCPTimer) capPack(times int) error {
+//	return nil
+//}
 
 func (this *TCPTimer) Serialize() ([]byte, error) {
 
@@ -904,39 +1151,197 @@ func (this *TCPTimer) BPF() string {
 	return fmt.Sprintf("tcp && host %s ", this.DstHost)
 }
 
-func (this *TCPTimer) DecodeTimestamp(data []byte) (int64, error) {
+func (this *TCPTimer) DecodeTimestamp(data []byte) (uint64, error) {
 
-	return 0, nil
+	var (
+		eth     layers.Ethernet
+		ip4     layers.IPv4
+		tcp     layers.TCP
+		payload gopacket.Payload
+		err     error
+	)
+	sendTimestamp := <-this.timestampChan
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip4, &tcp, &payload)
+	parser.IgnoreUnsupported = true
+	parser.IgnorePanic = true
+	decoded := []gopacket.LayerType{}
+
+	err = parser.DecodeLayers(data, &decoded)
+	if err != nil {
+		log.Println(err)
+		return 0, err
+	}
+	if uint16(tcp.DstPort) != this.srcPort {
+		return 0, errors.New("Not mine")
+	}
+	for _, opt := range tcp.Options {
+		if opt.OptionType == 8 {
+			ts := binary.BigEndian.Uint64(opt.OptionData)
+			//			log.Println(ts >> 32)
+			//			log.Println(uint32(ts))
+			return ts & 0x00000000ffffffff, nil
+		}
+	}
+	return sendTimestamp, nil
 }
 
 type UDPTimer struct {
 	BaseTimer
-	DstHost string
-	Port    uint16
+	DstHost        string
+	DstPort        uint16
+	srcPort        uint16
+	birthTimestamp time.Time
+	syncChan       chan uint64
+	timestampChan  chan uint64
 }
 
-func (this *UDPTimer) Rtt(times int) (uint64, error) {
-
-	return 0, nil
+func NewUDPTimer(dstHost string) *UDPTimer {
+	timer := &UDPTimer{
+		DstHost:       dstHost,
+		syncChan:      make(chan uint64),
+		timestampChan: make(chan uint64, 1),
+	}
+	timer.BaseTimer.ProtocolTimer = timer
+	return timer
 }
+
+//func (this *UDPTimer) Rtt(times int) (uint64, error) {
+
+//	return 0, nil
+//}
 
 func (this *UDPTimer) Serialize() ([]byte, error) {
 
-	return nil, nil
+	this.srcPort = uint16(mrand.Int())
+	data, err := MAC_UDPPack(this.DstHost, this.srcPort, this.DstPort, []byte("xxx"))
+	if err != nil {
+		log.Println(err)
+	}
+	return data, err
 }
 
 func (this *UDPTimer) BPF() string {
 	return fmt.Sprintf("icmp && host %s ", this.DstHost)
 }
 
-func (this *UDPTimer) DecodeTimestamp(data []byte) (int64, error) {
-	return 0, nil
+func (this *UDPTimer) SendPack() error {
+
+	data, err := this.Serialize()
+	if err != nil {
+		log.Println(err)
+		return err
+	}
+	log.Println("UDPTimer SendPack return")
+	now := time.Now()
+	this.timestampChan <- uint64(midNightDuration(&now) / time.Millisecond)
+	log.Println("UDPTimer SendPack return")
+	err = this.handle.WritePacketData(data)
+	if err != nil {
+		log.Println(err)
+		return err
+	}
+	log.Println("UDPTimer SendPack return")
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	select {
+	case <-ticker.C:
+		//		return nil
+	case <-this.syncChan:
+		//		return nil
+	}
+	log.Println("UDPTimer SendPack return")
+	return err
+}
+
+func (this *UDPTimer) CapPack(stopChan chan byte) chan uint64 {
+
+	packetSource := gopacket.NewPacketSource(this.handle, this.handle.LinkType())
+	packets := packetSource.Packets()
+	rttChan := make(chan uint64)
+	go func(stopChan chan byte) {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		var (
+			err error
+			ts  uint64
+		)
+		for {
+			select {
+			case packet := <-packets:
+
+				ts, err = this.DecodeTimestamp(packet.Data())
+				if err != nil {
+					if err.Error() == "Not mine" {
+						continue
+					} else {
+						log.Println(err)
+						return
+					}
+				}
+				//				log.Println(uint64(midNightDuration(&packet.Metadata().CaptureInfo.Timestamp).Nanoseconds()) / 1000000)
+				rtt := uint64(midNightDuration(&packet.Metadata().CaptureInfo.Timestamp)/time.Millisecond) - ts
+				//				log.Println("rtt:", rtt)
+				rttChan <- rtt
+				this.syncChan <- 0
+			case <-ticker.C:
+				<-this.timestampChan
+				this.syncChan <- 0
+				log.Println("timeout")
+				continue
+			case <-stopChan:
+				log.Println("return")
+				return
+			}
+		}
+	}(stopChan)
+
+	return rttChan
+
+}
+
+func (this *UDPTimer) DecodeTimestamp(data []byte) (uint64, error) {
+	var (
+		eth     layers.Ethernet
+		ip4     layers.IPv4
+		udp     layers.UDP
+		icmp    layers.ICMPv4
+		payload gopacket.Payload
+		err     error
+	)
+	ts := <-this.timestampChan
+	log.Println("ts", ts)
+	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &ip4, &icmp, &payload)
+	parser.IgnoreUnsupported = true
+	parser.IgnorePanic = true
+	decoded := []gopacket.LayerType{}
+
+	err = parser.DecodeLayers(data, &decoded)
+	if err != nil {
+		log.Println(err)
+		return 0, err
+	}
+
+	//解析icmp不可达数据包的payload
+	udpParser := gopacket.NewDecodingLayerParser(layers.LayerTypeIPv4, &ip4, &udp)
+	udpParser.IgnoreUnsupported = true
+	udpParser.IgnorePanic = true
+	udpDecoded := []gopacket.LayerType{}
+	err = udpParser.DecodeLayers([]byte(payload), &udpDecoded)
+	if err != nil {
+		log.Println(err)
+		return 0, err
+	}
+	if uint16(udp.DstPort) != this.DstPort {
+		return 0, errors.New("Not mine")
+	}
+
+	return ts, nil
 }
 
 type VxLanTimer struct {
-	VNI   uint32
-	XHost string
-	//	Host    string
+	VNI     uint32
+	XHost   string
+	xPort   uint16
 	Payload VxLanTimerPayload
 	conn    *net.UDPConn
 	lock    sync.Mutex
@@ -945,14 +1350,14 @@ type VxLanTimer struct {
 
 type VxLanTimerPayload interface {
 	Serialize() ([]byte, error)
-	DecodeTimestamp([]byte) (int64, error)
+	DecodeTimestamp([]byte) (uint64, error)
 }
 
 func (this *VxLanTimer) Rtt(times int) (uint64, error) {
 
 	this.lock.Lock()
 	defer this.lock.Unlock()
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprint(this.XHost, ":4789"))
+	addr, err := net.ResolveUDPAddr("udp", fmt.Sprint(this.XHost, this.xPort))
 	if err != nil {
 		log.Println(err)
 		return 0, err
@@ -1001,13 +1406,13 @@ func (this *VxLanTimer) receive(times int) (uint64, error) {
 			return 0, err
 		}
 		now := time.Now()
-		nowTs := midNightDuration(&now).Nanoseconds() / 10000000
+		nowTs := uint64(midNightDuration(&now).Nanoseconds()) / 10000000
 		ts, err := this.Payload.DecodeTimestamp(buffer[:n])
 		if err != nil {
 			log.Println(err)
 			return 0, err
 		}
-		rtt += uint64(nowTs - ts)
+		rtt += nowTs - ts
 		time.Sleep(500 * time.Microsecond)
 	}
 

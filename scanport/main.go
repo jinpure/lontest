@@ -19,8 +19,8 @@ func main() {
 	}
 	defer handle.Close()
 
-	//	UDPScanPort(lontest.DNSIP, handle)
-	TCPScanPort(lontest.LonIP, handle)
+	UDPScanPort(lontest.DNSHost, handle)
+	//	TCPScanPort(lontest.BaiduIP, handle)
 
 }
 
@@ -38,11 +38,17 @@ func UDPScanPort(destHost string, handle *pcap.Handle) {
 	}
 }
 
-func TCPScanPort(destHost string, handle *pcap.Handle) {
+func TCPScanPort(destHost string, handle *pcap.Handle) error {
 	var dstPort uint32
 	for ; dstPort <= 65535; dstPort++ {
 		time.Sleep(500 * time.Microsecond)
-		pack := lontest.TCPSynPack(destHost, 10010, uint16(dstPort))
+		pack, err := lontest.TCPSynPack(destHost, 10010, uint16(dstPort))
+		if err != nil {
+			log.Println(err)
+			return err
+		}
 		handle.WritePacketData(pack)
 	}
+
+	return nil
 }

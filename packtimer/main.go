@@ -21,6 +21,7 @@ func main() {
 	dstHost := flag.String("h", "", "the destination host")
 	device := flag.String("d", "en1", "the network device")
 	port := flag.Int("port", 0, "the destination port")
+	times := flag.Int("t", 10, "times")
 	flag.Parse()
 	if len(os.Args) == 1 {
 		fmt.Println(usage)
@@ -36,10 +37,10 @@ func main() {
 		log.Fatal(err)
 	}
 
-	rtt, err := packTimer.Rtt(10)
+	rtt, err := packTimer.Rtt(*times)
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Println("rtt:", rtt)
+	fmt.Println("average rtt:", rtt)
 	return
 }
