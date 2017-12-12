@@ -2,6 +2,8 @@
 package main
 
 import (
+	"fmt"
+	"os"
 	//	"fmt"
 	"log"
 	"lontest"
@@ -11,6 +13,10 @@ import (
 )
 
 func main() {
+	if len(os.Args) <= 1 {
+		fmt.Println("need host")
+		return
+	}
 	lontest.SetEntherNet("en1")
 	// Open device
 	handle, err := pcap.OpenLive("en1", 1024, false, 30*time.Second)
@@ -19,7 +25,7 @@ func main() {
 	}
 	defer handle.Close()
 
-	UDPScanPort(lontest.DNSHost, handle)
+	UDPScanPort(os.Args[1], handle)
 	//	TCPScanPort(lontest.BaiduIP, handle)
 
 }

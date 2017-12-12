@@ -27,6 +27,9 @@ func main() {
 		fmt.Println(usage)
 		return
 	}
+	//	if *protocol == "udp" {
+	//		*times = 65535
+	//	}
 	if *vxlan {
 		*protocol = fmt.Sprint("x", *protocol)
 	}

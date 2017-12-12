@@ -29,7 +29,7 @@ const (
 	huaweiMAC string = "8c:34:fd:ea:b4:aa"
 	zteMAC    string = "64:13:6c:a2:84:b9"
 	XiaomiMAC string = "78:11:dc:03:7e:a0"
-	routerMAC string = zteMAC
+	routerMAC string = huaweiMAC
 
 	snapshot_len int32         = 1600
 	VNI          uint32        = 998
@@ -593,9 +593,15 @@ func NewPacketTimer(timerType, dstHost string, dstPort uint16) (PackTimer, error
 	var timer PackTimer
 	switch timerType {
 	case "udpv4", "udp":
-		timer = NewUDPTimer(dstHost)
+		timer = NewUDPTimer(dstHost, dstPort)
+	case "xudp":
+		timer = NewVxLanTimer(LonIP, LonPort, NewUDPTimer(dstHost, dstPort))
+		log.Println("xudp")
 	case "tcpv4", "tcp":
 		timer = NewTcpTimer(dstHost, dstPort)
+	case "xtcp":
+		timer = NewVxLanTimer(LonIP, LonPort, NewTcpTimer(dstHost, dstPort))
+
 	case "icmpv4", "icmp":
 		timer = NewICMPv4Timer(dstHost)
 	case "xicmpv4", "xicmp":
@@ -610,6 +616,7 @@ func NewPacketTimer(timerType, dstHost string, dstPort uint16) (PackTimer, error
 func NewVxLanTimer(xHost string, xPort uint16, payload VxLanTimerPayload) *VxLanTimer {
 	return &VxLanTimer{
 		XHost:   xHost,
+		xPort:   xPort,
 		Payload: payload,
 	}
 }
@@ -661,7 +668,7 @@ func (this *BaseTimer) Rtt(times int) (uint64, error) {
 	go func(times int, done chan byte) {           //发包goroutine
 		for i := 1; i <= times; i++ {
 
-			log.Println("i:", i)
+			//			log.Println("i:", i)
 			err = this.ProtocolTimer.SendPack()
 			if err != nil {
 				log.Println(err)
@@ -669,16 +676,14 @@ func (this *BaseTimer) Rtt(times int) (uint64, error) {
 			}
 
 		}
-		log.Println("done")
+		//		log.Println("done")
 		done <- 0
 	}(times, this.done)
 
-	<-this.done //等待calcRtt退出
-	log.Println("calcRtt退出")
-	<-this.done //等待发包goroutine退出
-	log.Println("发包goroutine")
+	<-this.done //等待calcRtt、发包退出
+	<-this.done
 	stopCap <- 0 //通知抓包goroutine退出
-	log.Println("stopCap")
+
 	if this.recvTimes == 0 {
 		return 0, errors.New("No reply packet")
 	}
@@ -1195,9 +1200,11 @@ type UDPTimer struct {
 	timestampChan  chan uint64
 }
 
-func NewUDPTimer(dstHost string) *UDPTimer {
+func NewUDPTimer(dstHost string, dstPort uint16) *UDPTimer {
+
 	timer := &UDPTimer{
 		DstHost:       dstHost,
+		DstPort:       dstPort,
 		syncChan:      make(chan uint64),
 		timestampChan: make(chan uint64, 1),
 	}
@@ -1357,7 +1364,7 @@ func (this *VxLanTimer) Rtt(times int) (uint64, error) {
 
 	this.lock.Lock()
 	defer this.lock.Unlock()
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprint(this.XHost, this.xPort))
+	addr, err := net.ResolveUDPAddr("udp", fmt.Sprint(this.XHost, ":", this.xPort))
 	if err != nil {
 		log.Println(err)
 		return 0, err
@@ -1406,7 +1413,7 @@ func (this *VxLanTimer) receive(times int) (uint64, error) {
 			return 0, err
 		}
 		now := time.Now()
-		nowTs := uint64(midNightDuration(&now).Nanoseconds()) / 10000000
+		nowTs := uint64(midNightDuration(&now) / time.Millisecond)
 		ts, err := this.Payload.DecodeTimestamp(buffer[:n])
 		if err != nil {
 			log.Println(err)
