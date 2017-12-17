@@ -2,7 +2,7 @@
 package main
 
 import (
-	//	"fmt"
+	"flag"
 	"log"
 	"lontest"
 	"time"
@@ -12,9 +12,12 @@ import (
 
 func main() {
 	var port uint32
-	lontest.SetEntherNet("en1")
+	net := flag.String("net", "en1", "the name of net interface")
+	flag.Parse()
 
-	handle, err := pcap.OpenLive("en1", 1024, false, 30*time.Second)
+	lontest.SetEntherNet(*net)
+
+	handle, err := pcap.OpenLive(*net, 1024, false, 30*time.Second)
 	if err != nil {
 		log.Println(err)
 		return

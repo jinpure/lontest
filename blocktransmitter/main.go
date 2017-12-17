@@ -2,19 +2,21 @@
 package main
 
 import (
-	"fmt"
+	"flag"
 	"log"
 	"lontest"
 	"math/rand"
 	"time"
 
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
 )
 
 func main() {
-	handle, err := pcap.OpenLive("env", 1600, false, 5*time.Duration)
+	net := flag.String("net", "en1", "the name of net interface")
+	flag.Parse()
+	lontest.SetEntherNet(*net)
+
+	handle, err := pcap.OpenLive(*net, 1600, false, 5*time.Second)
 	if err != nil {
 		log.Println(err)
 		return

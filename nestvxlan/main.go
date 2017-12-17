@@ -3,6 +3,7 @@ package main
 
 //	"fmt"
 import (
+	"flag"
 	"log"
 	"lontest"
 	"time"
@@ -11,17 +12,21 @@ import (
 )
 
 func main() {
-	handle, err := pcap.OpenLive("en1", 1024, false, 30*time.Second)
+	net := flag.String("net", "en1", "the name of net interface")
+	n := flag.Int("n", 3, "nest deepth")
+	flag.Parse()
+	lontest.SetEntherNet(*net)
+	handle, err := pcap.OpenLive(*net, 1024, false, 30*time.Second)
 	if err != nil {
 		log.Println(err)
 		return
 	}
-	lontest.SetEntherNet("en1")
+
 	pack, err := lontest.DNSQueryPack(lontest.DNSHost, "www.baidu.com")
 	if err != nil {
 		log.Fatal(err)
 	}
-	nestvxlan, err := lontest.NestVxLan(3, lontest.LonIP, pack)
+	nestvxlan, err := lontest.NestVxLan(*n, lontest.LonIP, pack)
 	if err != nil {
 		log.Fatal(err)
 	}
